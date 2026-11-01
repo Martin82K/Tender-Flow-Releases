@@ -1,0 +1,44 @@
+# Reviewed template installed unchanged in Tender-Flow-Releases/.github/workflows/.
+name: Desktop policy expiry watchdog
+on:
+  schedule:
+    - cron: '47 5,17 * * *'
+  workflow_dispatch:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify both public policies without credentials
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { createPublicKey, verify } from 'node:crypto';
+          const key = createPublicKey({ key: Buffer.from('MCowBQYDK2VwAyEAvmki1GeT3IRMduh0+BiD/CUqHEqMHPOFtMqXXjUnTXs=', 'base64'), format: 'der', type: 'spki' });
+          const urls = ['https://www.tenderflow.cz/desktop-update-policy.json', 'https://raw.githubusercontent.com/Martin82K/Tender-Flow-Releases/main/desktop-update-policy.json'];
+          const texts = await Promise.all(urls.map(async url => {
+            const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(5000), cache: 'no-store' });
+            if (response.status !== 200 || !response.body) throw Error('Policy endpoint unavailable');
+            const reader = response.body.getReader(); const chunks = []; let size = 0;
+            try { while (true) { const { done, value } = await reader.read(); if (done) break; size += value.length;
+              if (size > 16384) throw Error('Oversized policy'); chunks.push(Buffer.from(value)); }
+            } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
+            const text = Buffer.concat(chunks).toString('utf8'); const envelope = JSON.parse(text);
+            const payload = Buffer.from(envelope.payload, 'base64'); const signature = Buffer.from(envelope.signature, 'base64');
+            if (payload.toString('base64') !== envelope.payload || signature.toString('base64') !== envelope.signature
+              || !verify(null, payload, key, signature)) throw Error('Invalid policy signature');
+            const record = JSON.parse(payload.toString('utf8')); const now = Date.now();
+            if (record.schema !== 1 || record.purpose !== 'tender-flow/windows-startup-policy/v1'
+              || record.platform !== 'win32' || record.arch !== 'x64' || record.channel !== 'stable'
+              || !Number.isSafeInteger(record.sequence) || record.sequence < 1
+              || !Number.isSafeInteger(record.issuedAt) || !Number.isSafeInteger(record.expiresAt)
+              || record.issuedAt > now + 300000 || record.expiresAt - record.issuedAt > 30 * 86400000
+              || record.expiresAt - now <= 14 * 86400000) throw Error('Policy renewal overdue or invalid');
+            return text;
+          }));
+          if (texts[0] !== texts[1]) throw Error('Policy endpoints disagree');
+          console.log('Both signed policies agree and have more than 14 days remaining.');
+          JS
